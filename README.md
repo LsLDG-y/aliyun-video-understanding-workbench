@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![No third-party deps](https://img.shields.io/badge/deps-none-orange)]()
 
-一个开箱即用的 **视频理解 + 多分支上下文对话** 前端工具，基于阿里云百炼（DashScope）大模型。
+一个开箱即用的 **视频理解 + 多分支上下文对话** 前端工具，基于阿里云百炼（DashScope）大模型。目前首个基于百炼平台的可用前端。
 
 - 选择本地视频 → **直接上传**到百炼临时存储（48h 有效）→ 以原生 `video_url` 交给大模型理解（官方抽帧管道，效果最佳，支持视频里的**声音/音效**理解）
 - 每个视频理解完成后成为一个**项目**，项目下可创建**多个分支对话**，围绕同一视频进行不同方向的追问，上下文连续
