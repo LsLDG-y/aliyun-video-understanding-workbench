@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>视频理解工作台 · 阿里云百炼</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎬</text></svg>">
+</head>
+<body>
+
+<!-- ======= 顶部栏 ======= -->
+<header class="topbar">
+  <div class="brand">
+    <div class="brand-logo">▶</div>
+    <div class="brand-text">
+      <h1>视频理解工作台</h1>
+      <span>阿里云百炼 · 多分支视频理解与对话</span>
+    </div>
+  </div>
+  <div class="topbar-actions">
+    <div id="serverBadge" class="badge badge-warn" title="正在检测本地服务">服务检测中…</div>
+    <div id="apiKeyBadge" class="badge badge-warn" title="尚未在设置中配置 API Key">未配置 API Key</div>
+    <span id="appVersion" class="badge badge-version" title="版本">v1.0</span>
+    <button id="btnSettings" class="btn btn-ghost" title="设置">⚙ 设置</button>
+  </div>
+</header>
+
+<!-- ======= 主区域 ======= -->
+<main class="layout">
+
+  <!-- 项目栏 -->
+  <aside id="projectPanel" class="panel panel-projects">
+    <div class="panel-head">
+      <span class="panel-title">项目（视频）</span>
+      <button id="btnNewProject" class="btn btn-primary btn-sm">＋ 新建项目</button>
+    </div>
+    <div id="projectList" class="project-list">
+      <div class="empty-hint" id="projectEmptyHint">
+        <div class="empty-icon">🎬</div>
+        <p>尚无项目</p>
+        <p class="empty-sub">点击「新建项目」，选择一个视频开始理解</p>
+      </div>
+    </div>
+  </aside>
+
+  <!-- 分支对话栏 -->
+  <section id="convPanel" class="panel panel-convs">
+    <div class="panel-head">
+      <span class="panel-title" id="convPanelTitle">对话</span>
+      <button id="btnNewConv" class="btn btn-ghost btn-sm" disabled>＋ 分支对话</button>
+    </div>
+    <div id="videoCard" class="video-card hidden">
+      <div id="videoThumbBox" class="video-thumb"><span>🎞</span></div>
+      <div class="video-meta">
+        <div class="video-name" id="videoName">-</div>
+        <div class="video-spec" id="videoSpec">-</div>
+        <div class="video-actions">
+          <button id="btnVideoRename" class="btn btn-xs btn-ghost" title="重命名项目">✎ 重命名</button>
+          <button id="btnVideoReupload" class="btn btn-xs btn-ghost" title="重新上传视频文件（临时链接 48 小时有效；过期后可恢复「每轮附带视频」）">⬆ 重新上传</button>
+          <button id="btnVideoReAnalyze" class="btn btn-xs btn-ghost" title="换模型或参数重新理解">🔄 重新理解</button>
+          <button id="btnVideoDelete" class="btn btn-xs btn-danger-ghost" title="删除项目">🗑 删除</button>
+        </div>
+        <input type="file" id="reuploadFileInput" accept="video/*,.mp4,.avi,.mkv,.mov,.flv,.wmv,.webm,.m4v,.ts" hidden>
+      </div>
+    </div>
+    <div id="convList" class="conv-list">
+      <div class="empty-hint" id="convEmptyHint">
+        <p>选择左侧项目后</p>
+        <p class="empty-sub">在此创建分支对话</p>
+      </div>
+    </div>
+    <div class="panel-foot" id="convFoot"></div>
+  </section>
+
+  <!-- 聊天区 -->
+  <section id="chatPanel" class="panel panel-chat">
+    <div class="chat-head" id="chatHead">
+      <div class="chat-title" id="chatTitle">开始</div>
+      <div class="chat-tools hidden" id="chatTools">
+        <label class="tool-select">
+          <span>模型</span>
+          <select id="chatModelSelect" class="input input-sm"></select>
+        </label>
+        <button id="btnModelInfo" class="btn btn-xs btn-ghost" title="查看当前模型的适用场景与限制">ⓘ</button>
+        <label class="tool-check" id="attachVideoWrap" title="开启后每一轮对话都会附带视频文件，模型可随时核对画面；每轮都会重新计算视频 Token（费用更高）；仅视觉/全模态模型支持（纯文本模型会自动阻止）">
+          <input type="checkbox" id="chatAttachVideo">
+          <span>每轮附带视频</span>
+        </label>
+        <button id="btnChatRename" class="btn btn-ghost btn-sm" title="重命名对话">✎</button>
+        <button id="btnChatDelete" class="btn btn-danger-ghost btn-sm" title="删除对话">🗑</button>
+      </div>
+    </div>
+
+    <div id="chatMessages" class="chat-messages">
+      <div class="empty-hint" id="chatEmptyHint">
+        <div class="empty-icon">💬</div>
+        <p>选择或新建一个对话</p>
+        <p class="empty-sub">在项目下可建立多个分支对话，围绕同一视频进行不同方向的讨论；<br>右上角可切换模型（视觉/全模态用于核对画面，<b>纯文本模型仅用于追问讨论</b>，更省）</p>
+      </div>
+    </div>
+
+    <div id="usageBar" class="usage-bar hidden">
+      <span id="usageBarText"></span>
+    </div>
+
+    <button id="btnScrollBottom" class="scroll-bottom hidden" title="滚动到底部">↓</button>
+
+    <div class="chat-input-area hidden" id="chatInputArea">
+      <div id="estBar" class="est-bar" title="本次发送的预估消耗（视觉 Token 按百炼官方公式计算，文本为近似估算）">
+        <span class="est-model" id="estBarModel"></span>
+        <span id="estBarText">预计输入 Token：-</span>
+        <span class="est-detail" id="estBarDetail"></span>
+      </div>
+      <div class="input-row">
+        <textarea id="chatInput" rows="1" placeholder="围绕视频理解内容提问…（Enter 发送，Shift+Enter 换行）"></textarea>
+        <button id="btnSend" class="btn btn-primary btn-send">发送</button>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- ======= 新建项目向导 ======= -->
+<div id="modalWizard" class="modal-mask hidden">
+  <div class="modal modal-wide">
+    <div class="modal-head">
+      <h2>新建视频理解项目</h2>
+      <button class="modal-close" data-close="modalWizard">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="wizard-steps">
+        <div class="wstep active" data-step="1"><b>1</b> 选择视频</div>
+        <div class="wstep" data-step="2"><b>2</b> 模型与参数</div>
+        <div class="wstep" data-step="3"><b>3</b> 预估与理解</div>
+      </div>
+
+      <!-- Step 1 -->
+      <div class="wstep-pane active" data-pane="1">
+        <div class="dropzone" id="dropzone">
+          <div class="dz-inner">
+            <div class="dz-icon">🎬</div>
+            <p><b>拖拽视频到此处</b>，或</p>
+            <button id="btnPickVideo" class="btn btn-primary">选择本地视频文件</button>
+            <input type="file" id="videoFileInput" accept="video/*,.mp4,.avi,.mkv,.mov,.flv,.wmv,.webm,.m4v,.ts" hidden>
+          </div>
+          <div class="dz-or"><span>或</span></div>
+          <div class="dz-url">
+            <input id="videoUrlInput" class="input" placeholder="粘贴公网视频地址（https://… 无需上传，百炼直接解析）" spellcheck="false">
+            <button id="btnUseUrl" class="btn btn-ghost">使用 URL</button>
+          </div>
+          <label class="dz-mode">
+            <span><b>本地视频</b>：通过本地服务上传至百炼临时存储（48 小时有效）后以原生视频文件理解，效果最佳；<b>公网 URL</b>：跳过上传，要求地址可直接访问且响应头含 Content-Length / Content-Type。</span>
+          </label>
+          <div class="dz-tip">
+            💡 <b>模型怎么选？</b>短视频（≤150 秒）优先 <b>Omni 全模态</b>（能听声音、最划算）；<b>纯视觉 VL 系列</b>适合无需声音的较长视频；理解完成后还可切<b>纯文本模型</b>省钱追问。下一步会展示每个模型的适用场景与限制。
+          </div>
+        </div>
+
+        <div id="videoPreviewCard" class="video-preview hidden">
+          <video id="videoPreview" controls muted playsinline preload="metadata"></video>
+          <div class="vp-meta">
+            <div><span class="vp-k">名称</span><b id="vpName">-</b></div>
+            <div><span class="vp-k">时长</span><b id="vpDuration">-</b></div>
+            <div><span class="vp-k">分辨率</span><b id="vpSize">-</b></div>
+            <div><span class="vp-k">帧率</span><b id="vpFps">-</b></div>
+            <div><span class="vp-k">大小</span><b id="vpBytes">-</b></div>
+            <div><span class="vp-k">格式</span><b id="vpFormat">-</b></div>
+          </div>
+          <button id="btnResetVideo2" class="btn btn-ghost btn-sm">重新选择</button>
+        </div>
+      </div>
+
+      <!-- Step 2 -->
+      <div class="wstep-pane" data-pane="2">
+        <div class="form-grid">
+          <label class="field">
+            <span>理解模型</span>
+            <select id="wizModelSelect" class="input"></select>
+          </label>
+          <label class="field">
+            <span>抽帧频率 fps <i class="hint">百炼参数，每秒抽取帧数（0.1~10）</i></span>
+            <div class="slider-row">
+              <input type="range" id="wizFps" min="0.1" max="10" step="0.1" value="2">
+              <b id="fpsVal">2.0</b>
+            </div>
+          </label>
+          <label class="field">
+            <span>理解提示词 <i class="hint">首轮发送给模型的分析要求；所有分支对话都基于此结果</i></span>
+            <textarea id="wizPrompt" class="input input-area" rows="10">请以专业影视分析视角，极其详细地分析这段视频，输出完整分镜脚本与深度分析，按以下结构输出：
+
+【一、全局信息】
+1. 视频主题、类型（宣传片/纪录/短剧/演示等）与整体风格
+2. 画面质量与摄影特点
+3. 屏幕上出现的字幕/文案，请全文逐字转录
+
+【二、完整分镜脚本】
+按时间顺序输出每一个镜头，每条分镜包含：
+- 时间码：起始-结束（HH:mm:ss）
+- 景别与运镜：远景/全景/中景/近景/特写；固定/推/拉/摇/移/跟等
+- 画面内容：场景、人物（外貌、衣着、动作、表情）、物体与细节
+- 文字信息：字幕、Logo、品牌、号码等所有可识别文本
+- 声音：人声（逐字转录）、音乐情绪、环境音、音效
+- 转场方式：硬切/叠化/淡入淡出等
+
+【三、深度解析】
+1. 叙事脉络与人物关系（如有）
+2. 色彩基调、光影与布光特点
+3. 节奏与剪辑风格
+4. 重点细节清单：颜色、数字、符号等逐一列出
+
+【四、总结与延伸】
+用 200 字以内高度概括；再列出 3 个围绕该视频值得深入讨论的问题。</textarea>
+          </label>
+        </div>
+        <div id="wizModelInfo" class="model-info"></div>
+      </div>
+
+      <!-- Step 3 -->
+      <div class="wstep-pane" data-pane="3">
+        <div id="estimateCards" class="estimate-cards"></div>
+        <div id="estimateTable" class="estimate-table"></div>
+        <div id="warnList" class="warn-list"></div>
+        <label class="field" style="margin-top:14px">
+          <span>项目名称 <i class="hint">默认为视频文件名</i></span>
+          <input id="wizProjectName" class="input" placeholder="如：产品宣传片-理解">
+        </label>
+      </div>
+
+      <div id="uploadPanel" class="upload-panel hidden">
+        <div class="up-info">
+          <div class="up-icon">📤</div>
+          <div class="up-main">
+            <div class="up-name" id="upName">-</div>
+            <div class="up-stat" id="upStat">准备上传…</div>
+          </div>
+          <button id="btnUpCancel" class="btn btn-danger-ghost btn-xs hidden" title="取消本次上传（转存会一并停止，可立即重试）">取消</button>
+        </div>
+        <div class="up-bar"><div class="up-bar-fill" id="upBarFill"></div></div>
+      </div>
+
+      <div class="wizard-nav">
+        <button id="wizPrev" class="btn btn-ghost" disabled>上一步</button>
+        <span id="wizStepInfo" class="step-info">第 1 / 3 步</span>
+        <div class="wizard-nav-right">
+          <button id="wizCancel" class="btn btn-ghost">取消</button>
+          <button id="wizNext" class="btn btn-primary">下一步</button>
+          <button id="wizStart" class="btn btn-primary hidden">🚀 开始理解</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ======= 设置 ======= -->
+<div id="modalSettings" class="modal-mask hidden">
+  <div class="modal">
+    <div class="modal-head">
+      <h2>设置</h2>
+      <button class="modal-close" data-close="modalSettings">✕</button>
+    </div>
+    <div class="modal-body">
+      <label class="field">
+        <span>阿里云百炼 API Key <a href="https://help.aliyun.com/zh/model-studio/get-api-key" target="_blank" rel="noopener" class="ext-link">获取指南 ↗</a></span>
+        <div class="model-manage">
+          <input id="setApiKey" type="password" class="input" placeholder="sk-…（保存到项目文件夹 config.json）" spellcheck="false">
+          <button id="btnTestKey" class="btn btn-ghost btn-sm">测试连接</button>
+        </div>
+        <i class="hint">密钥由本地服务保存在项目文件夹的 config.json 中，仅本机使用，不会上传到任何三方服务。</i>
+      </label>
+      <label class="field">
+        <span>接口地址 Base URL</span>
+        <input id="setBaseUrl" class="input" value="https://dashscope.aliyuncs.com" spellcheck="false">
+        <i class="hint">默认百炼公网端点；若使用业务空间专属域名请填写对应地址（如 https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com）。</i>
+      </label>
+      <label class="field">
+        <span>模型管理 <i class="hint">常用模型列表；也可从百炼拉取全部可用模型（视觉/纯文本对话模型，自动过滤 OCR/向量/音频等）</i></span>
+        <div class="model-manage">
+          <select id="setModelSel" class="input"></select>
+          <button id="btnFetchModels" class="btn btn-ghost btn-sm">从百炼拉取模型列表</button>
+          <button id="btnRemoveModel" class="btn btn-danger-ghost btn-sm" title="移除下拉框中选中的自定义模型">🗑 移除</button>
+        </div>
+        <i id="fetchModelStatus" class="hint"></i>
+      </label>
+      <label class="field">
+        <span>单价参考（可选，用于费用预估）</span>
+        <div class="price-grid">
+          <div><input id="setPriceIn" type="number" step="0.01" min="0" class="input" placeholder="输入价 ¥/千Token"><i class="hint">输入价</i></div>
+          <div><input id="setPriceOut" type="number" step="0.01" min="0" class="input" placeholder="输出价 ¥/千Token"><i class="hint">输出价</i></div>
+        </div>
+        <i class="hint">价格随模型与地域变化，请以百炼控制台为准；留空则不显示费用。</i>
+      </label>
+      <hr class="sep">
+      <div class="settings-actions">
+        <button id="btnExportData" class="btn btn-ghost btn-sm">导出全部数据</button>
+        <button id="btnImportData" class="btn btn-ghost btn-sm">导入数据</button>
+        <input type="file" id="importFileInput" accept=".json" hidden>
+        <button id="btnClearAll" class="btn btn-danger-ghost btn-sm">清空全部数据</button>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-primary">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- ======= 删除确认 ======= -->
+<div id="modalConfirm" class="modal-mask hidden">
+  <div class="modal modal-sm">
+    <div class="modal-head"><h2 id="confirmTitle">确认</h2></div>
+    <div class="modal-body"><p id="confirmText" class="confirm-text"></p></div>
+    <div class="modal-foot">
+      <button id="confirmCancel" class="btn btn-ghost">取消</button>
+      <button id="confirmOk" class="btn btn-danger">确认</button>
+    </div>
+  </div>
+</div>
+
+<!-- ======= 模型说明 ======= -->
+<div id="modalModelInfo" class="modal-mask hidden">
+  <div class="modal modal-sm">
+    <div class="modal-head">
+      <h2 id="modelInfoTitle">模型说明</h2>
+      <button class="modal-close" data-close="modalModelInfo">✕</button>
+    </div>
+    <div class="modal-body" id="modelInfoBody"></div>
+    <div class="modal-foot">
+      <button class="btn btn-primary" data-close="modalModelInfo">知道了</button>
+    </div>
+  </div>
+</div>
+
+<!-- Toast -->
+<div id="toast" class="toast hidden"></div>
+
+<script src="assets/app.js"></script>
+</body>
+</html>
