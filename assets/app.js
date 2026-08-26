@@ -6,7 +6,7 @@
 'use strict';
 
 /* ---------------- 版本 ---------------- */
-const APP_VERSION = '1.2';
+const APP_VERSION = '1.3';
 
 /* ---------------- 小工具 ---------------- */
 const $ = (sel) => document.querySelector(sel);
@@ -36,6 +36,36 @@ function fmtBytes(n) {
 function fmtNum(n) {
   if (n == null || !isFinite(n)) return '-';
   return n.toLocaleString('zh-CN');
+}
+/* 上传/转存速度显示（字节/秒 → 可读） */
+function fmtSpeed(bytes, sec) {
+  if (!bytes || !sec || sec <= 0) return '';
+  const bps = bytes / sec;
+  if (bps >= 1024 * 1024) return (bps / 1024 / 1024).toFixed(1) + ' MB/s';
+  if (bps >= 1024) return (bps / 1024).toFixed(0) + ' KB/s';
+  return Math.round(bps) + ' B/s';
+}
+/* 即时速度表：每次调用传入当前已传字节，返回与上一次的瞬时速度 */
+function makeSpeedMeter() {
+  let lastBytes = 0, lastT = 0;
+  return function (bytes) {
+    const now = Date.now();
+    let speed = '';
+    if (lastT && bytes >= lastBytes) {
+      const dt = (now - lastT) / 1000;
+      if (dt > 0) speed = fmtSpeed(bytes - lastBytes, dt);
+    }
+    lastBytes = bytes; lastT = now;
+    return speed;
+  };
+}
+/* 基于「进度 + 已耗时」的剩余时间估算 */
+function etaFromProgress(progress, waited) {
+  if (progress == null || progress <= 0 || !waited) return '';
+  const p = Math.min(1, progress);
+  const remain = waited * ((1 - p) / Math.max(0.02, p));
+  if (remain <= 0 || remain > 24 * 3600) return '';
+  return fmtDuration(remain);
 }
 function fmtTokens(n) {
   if (n == null || !isFinite(n)) return '-';
@@ -421,7 +451,7 @@ const Api = {
       let settled = false;
       const fail = (err) => { if (!settled) { settled = true; reject(err); } };
       if (ctrl) ctrl.abortXhr = () => { ctrl.aborted = true; try { xhr.abort(); } catch (e) { /* ignore */ } };
-      xhr.upload.onprogress = (e) => { if (e.lengthComputable && onProgress) onProgress(e.loaded / e.total); };
+      xhr.upload.onprogress = (e) => { if (e.lengthComputable && onProgress) onProgress(e.loaded / e.total, e.loaded, e.total); };
       xhr.upload.onerror = () => fail(new Error('上传中断，请检查本地服务是否运行'));
       xhr.onerror = () => fail(new Error('网络错误：无法连接本地服务'));
       xhr.onabort = () => fail(new Error('已取消上传'));
@@ -456,7 +486,7 @@ const Api = {
       let settled = false;
       const fail = (err) => { if (!settled) { settled = true; reject(err); } };
       if (ctrl) ctrl.abortXhr = () => { ctrl.aborted = true; try { xhr.abort(); } catch (e) {} };
-      xhr.upload.onprogress = (e) => { if (e.lengthComputable && onProgress) onProgress(e.loaded / e.total); };
+      xhr.upload.onprogress = (e) => { if (e.lengthComputable && onProgress) onProgress(e.loaded / e.total, e.loaded, e.total); };
       xhr.upload.onerror = () => fail(new Error('上传中断，请检查本地服务是否运行'));
       xhr.onerror = () => fail(new Error('网络错误：无法连接本地服务'));
       xhr.onabort = () => fail(new Error('已取消压缩'));
@@ -564,7 +594,7 @@ async function pollTransit(key, resolve, reject, onTransit, abortCheck) {
     const waited = Math.floor((Date.now() - t0) / 1000);
     if (s && s.error) { reject(new Error(s.error)); return; }
     if (phase === 'done' && s && s.result) {
-      if (onTransit) onTransit({ phase, progress: 1, waited, msg: '转存完成' });
+      if (onTransit) onTransit({ phase, progress: 1, waited, msg: '转存完成', uploaded: s.uploaded, total: s.total });
       resolve({ ...s.result, waited });
       return;
     }
@@ -586,7 +616,7 @@ async function pollTransit(key, resolve, reject, onTransit, abortCheck) {
       reject(new Error('转存停滞（10 分钟无进展，可能网络中断或凭证失效），请检查网络后重试'));
       return;
     }
-    if (onTransit) onTransit({ phase, progress, waited, msg: '' });
+    if (onTransit) onTransit({ phase, progress, waited, msg: '', uploaded: s.uploaded, total: s.total });
     await new Promise((r) => setTimeout(r, 1000));
   }
 }
@@ -609,7 +639,7 @@ async function pollCompress(key, resolve, reject, onPhase, abortCheck) {
     const waited = Math.floor((Date.now() - t0) / 1000);
     if (s && s.error) { reject(new Error(s.error)); return; }
     if (phase === 'done' && s && s.result) {
-      if (onPhase) onPhase({ phase, progress: 1, waited, msg: '完成' });
+      if (onPhase) onPhase({ phase, progress: 1, waited, msg: '完成', uploaded: s.uploaded, total: s.total, doneSec: s.doneSec, durSec: s.durSec });
       resolve({ ...s.result, waited });
       return;
     }
@@ -619,7 +649,7 @@ async function pollCompress(key, resolve, reject, onPhase, abortCheck) {
     const stalled = Math.floor((Date.now() - lastChange) / 1000);
     if (waited > TOTAL_LIMIT) { reject(new Error('压缩超时（已等待 1 小时），请检查后重试')); return; }
     if (waited > 60 && stalled > STALL_LIMIT) { reject(new Error('压缩停滞（15 分钟无进展），可能 ffmpeg 卡住，请重试')); return; }
-    if (onPhase) onPhase({ phase, progress, waited, msg: '' });
+    if (onPhase) onPhase({ phase, progress, waited, msg: '', uploaded: s.uploaded, total: s.total, doneSec: s.doneSec, durSec: s.durSec });
     await new Promise((r2) => setTimeout(r2, 800));
   }
 }
@@ -658,14 +688,30 @@ async function startCompress() {
   _cmpCtrl = ctrl;
   $('#cmpCancel').onclick = () => { if (ctrl.abortXhr) ctrl.abortXhr(); };
   try {
-    const r = await Api.compress(_cmpFile, model, settings, (p) => {
+    const spR = makeSpeedMeter();   // 接收阶段
+    let spU = null;                 // 上传阶段（首次进入时创建）
+    const r = await Api.compress(_cmpFile, model, settings, (p, loaded, total) => {
       $('#cmpBarFill').style.width = Math.round(p * 100) + '%';
-      if (p < 1) $('#cmpStat').textContent = '上传文件到本地服务… ' + Math.round(p * 100) + '%';
-    }, ({ phase, progress, waited }) => {
+      const b = (loaded != null && total != null) ? ('已传 ' + fmtBytes(loaded) + ' / ' + fmtBytes(total)) : '';
+      const spd = spR(loaded || 0);
+      if (p < 1) $('#cmpStat').textContent = '上传文件到本地服务… ' + Math.round(p * 100) + '%' + (b ? ' · ' + b : '') + (spd ? ' · ' + spd : '');
+    }, ({ phase, progress, waited, uploaded, total, doneSec, durSec }) => {
       const mm = String(Math.floor(waited / 60)).padStart(2, '0'), ss = String(waited % 60).padStart(2, '0');
       $('#cmpStatus').textContent = cmpPhaseLabel(phase);
       if (phase === 'done') { $('#cmpBarFill').style.width = '100%'; $('#cmpStat').textContent = '压缩完成 ✓'; }
-      else if (progress > 0) {
+      else if (phase === 'uploading' || (uploaded != null)) {
+        if (!spU) spU = makeSpeedMeter();
+        const byt = (uploaded != null && total != null) ? ('已传 ' + fmtBytes(uploaded) + ' / ' + fmtBytes(total)) : '';
+        const spd = spU(uploaded || 0);
+        const eta = etaFromProgress(progress, waited);
+        $('#cmpBarFill').style.width = Math.round(Math.max(2, progress * 100)) + '%';
+        $('#cmpStat').textContent = '上传到百炼 ' + Math.round(progress * 100) + '%' + (byt ? ' · ' + byt : '') + (spd ? ' · ' + spd : '') + (eta ? ' · 剩余约 ' + eta : '') + ' · 已等待 ' + mm + ':' + ss;
+      } else if (phase === 'compressing') {
+        $('#cmpBarFill').style.width = Math.round(Math.max(2, progress * 100)) + '%';
+        const tt = (doneSec != null && durSec) ? ('已处理 ' + fmtDuration(doneSec) + ' / ' + fmtDuration(durSec)) : '';
+        const eta = etaFromProgress(progress, waited);
+        $('#cmpStat').textContent = '压缩中 ' + Math.round(progress * 100) + '%' + (tt ? ' · ' + tt : '') + (eta ? ' · 剩余约 ' + eta : '') + ' · 已等待 ' + mm + ':' + ss;
+      } else if (progress > 0) {
         $('#cmpBarFill').style.width = Math.round(Math.max(2, progress * 100)) + '%';
         $('#cmpStat').textContent = cmpPhaseLabel(phase) + ' ' + Math.round(progress * 100) + '% · 已等待 ' + mm + ':' + ss;
       } else {
@@ -1655,15 +1701,23 @@ async function reuploadProjectVideo(file) {
   const prevFoot = $('#convFoot').textContent;
   try {
     $('#convFoot').textContent = '正在上传「' + file.name + '」到本地服务… 0%';
-    const r = await Api.upload(file, project.model, (pct) => {
-      $('#convFoot').textContent = '正在上传到本地服务… ' + Math.round(pct * 100) + '%';
-    }, ({ phase, progress, waited }) => {
+    const footSp1 = makeSpeedMeter();
+    let footSp2 = null;
+    const r = await Api.upload(file, project.model, (pct, loaded, total) => {
+      const b = (loaded != null && total != null) ? ('已传 ' + fmtBytes(loaded) + ' / ' + fmtBytes(total)) : '';
+      const spd = footSp1(loaded || 0);
+      $('#convFoot').textContent = '正在上传到本地服务… ' + Math.round(pct * 100) + '%' + (b ? ' · ' + b : '') + (spd ? ' · ' + spd : '');
+    }, ({ phase, progress, waited, uploaded, total }) => {
       const mm = String(Math.floor(waited / 60)).padStart(2, '0');
       const ss = String(waited % 60).padStart(2, '0');
       if (phase === 'done') {
         $('#convFoot').textContent = '转存完成 ✓ 新临时链接 48 小时有效';
       } else if (phase === 'uploading' || progress > 0) {
-        $('#convFoot').textContent = '正在转存至阿里云临时存储… ' + Math.round(Math.max(2, progress * 100)) + '% · 已等待 ' + mm + ':' + ss;
+        if (!footSp2) footSp2 = makeSpeedMeter();
+        const byt = (uploaded != null && total != null) ? ('已传 ' + fmtBytes(uploaded) + ' / ' + fmtBytes(total)) : '';
+        const spd = footSp2(uploaded || 0);
+        const eta = etaFromProgress(progress, waited);
+        $('#convFoot').textContent = '正在转存至阿里云临时存储… ' + Math.round(Math.max(2, progress * 100)) + '%' + (byt ? ' · ' + byt : '') + (spd ? ' · ' + spd : '') + (eta ? ' · 剩余约 ' + eta : '') + ' · 已等待 ' + mm + ':' + ss;
       } else {
         $('#convFoot').textContent = '正在准备转存（获取凭证）… 已等待 ' + mm + ':' + ss;
       }
@@ -2298,11 +2352,15 @@ async function uploadForWizard() {
     lastStat = s;
     $('#upStat').textContent = s;
   };
+  const sp1 = makeSpeedMeter();      // 阶段一 浏览器→本地服务
+  let sp2 = null;                    // 阶段二 转存（首次进入时创建）
   try {
-    const r = await Api.upload(wiz.file, model, (p) => {
+    const r = await Api.upload(wiz.file, model, (p, loaded, total) => {
       $('#upBarFill').style.width = Math.round(p * 100) + '%';
-      setStat('正在上传到本地服务… ' + Math.round(p * 100) + '%');
-    }, ({ phase, progress, waited }) => {
+      const b1 = (loaded != null && total != null) ? fmtBytes(loaded) + ' / ' + fmtBytes(total) : '';
+      const s1 = sp1(loaded || 0);
+      setStat('正在上传到本地服务… ' + Math.round(p * 100) + '%' + (b1 ? ' · 已传 ' + b1 : '') + (s1 ? ' · ' + s1 : ''));
+    }, ({ phase, progress, waited, uploaded, total }) => {
       /* 阶段一完成拿到 uploadKey 后立即落盘断点（此后刷新可恢复） */
       if (upCtrl.uploadKey && lastKey !== upCtrl.uploadKey) {
         lastKey = upCtrl.uploadKey;
@@ -2310,6 +2368,7 @@ async function uploadForWizard() {
       }
       const mm = String(Math.floor(waited / 60)).padStart(2, '0');
       const ss = String(waited % 60).padStart(2, '0');
+      const byt = (uploaded != null && total != null) ? ('已传 ' + fmtBytes(uploaded) + ' / ' + fmtBytes(total)) : '';
       if (phase === 'done') {
         $('#upBarFill').style.width = '100%';
         setStat('转存完成 ✓ 临时链接 48 小时有效');
@@ -2319,8 +2378,11 @@ async function uploadForWizard() {
         setStat('正在获取上传凭证… 已等待 ' + mm + ':' + ss);
       } else if (phase === 'uploading' || progress > 0) {
         /* 转存阶段：百分比实时增长（progress>0 时即认为在转存，避免文案误导） */
+        if (!sp2) sp2 = makeSpeedMeter();
+        const s2 = sp2(uploaded || 0);
+        const eta = etaFromProgress(progress, waited);
         $('#upBarFill').style.width = Math.round(Math.max(2, progress * 100)) + '%';
-        setStat('正在转存至阿里云临时存储… ' + Math.round(progress * 100) + '% · 已等待 ' + mm + ':' + ss);
+        setStat('正在转存至阿里云临时存储… ' + Math.round(progress * 100) + '%' + (byt ? ' · ' + byt : '') + (s2 ? ' · ' + s2 : '') + (eta ? ' · 剩余约 ' + eta : '') + ' · 已等待 ' + mm + ':' + ss);
       } else {
         $('#upBarFill').style.width = '8%';
         setStat('文件已接收，正在准备转存… 已等待 ' + mm + ':' + ss);

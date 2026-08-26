@@ -40,7 +40,7 @@ if sys.version_info < (3, 8):
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(ROOT, "config.json")
 HOST = "127.0.0.1"
-VERSION = "1.2"
+VERSION = "1.3"
 PREFERRED_PORTS = [8686, 8687, 8688, 8689, 8690, 8710]
 DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com"
 UPLOAD_API = "/api/v1/uploads"
@@ -428,6 +428,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({
                 "phase": st.get("phase", "received"),
                 "progress": st.get("progress", 0),
+                "uploaded": st.get("uploaded"),
+                "total": st.get("total"),
                 "result": st.get("result"),
                 "error": st.get("error"),
             })
@@ -439,6 +441,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({
                 "phase": st.get("phase", "received"),
                 "progress": st.get("progress", 0),
+                "uploaded": st.get("uploaded"),
+                "total": st.get("total"),
+                "doneSec": st.get("doneSec"),
+                "durSec": st.get("durSec"),
                 "result": st.get("result"),
                 "error": st.get("error"),
             })
@@ -787,7 +793,7 @@ def _oss_upload_worker(key, model, tmp_path, file_name, api_key, base_url, conte
             # 1GB 文件会产生 13 万次锁竞争；改为每 256KB 写一次（约 4000 次）
             if done - last_report[0] >= PROGRESS_WRITE_INTERVAL or done >= total:
                 last_report[0] = done
-                _set_upload(key, phase="uploading", progress=done / max(1, total))
+                _set_upload(key, phase="uploading", progress=done / max(1, total), uploaded=done, total=total)
 
         url = upload_file(api_key, base_url, model, tmp_path, file_name, content_type, on_sent=on_sent)
         _set_upload(key, phase="done", progress=1.0,
@@ -909,7 +915,7 @@ def _probe_video(ffmpeg, path):
 
 def _build_ffmpeg_args(ffmpeg, src, dst, target_res, target_fps, quality, info):
     """组装 ffmpeg 参数：只降不提（分辨率/帧率不放大）、宽高比不变、偶数尺寸、yuv420p 兼容、保留音频"""
-    args = [ffmpeg, "-y", "-hide_banner", "-i", src]
+    args = [ffmpeg, "-y", "-hide_banner", "-nostats", "-progress", "pipe:1", "-i", src]
     vf = []
     box = {"1080": (1920, 1080), "720": (1280, 720), "480": (854, 480)}.get(target_res)
     if box and info.get("width") and info.get("height"):
@@ -950,7 +956,8 @@ def _run_ffmpeg(args, key, duration):
                     try:
                         seconds = int(v) / 1e6
                         if duration:
-                            _set_compress(key, phase="compressing", progress=min(0.99, seconds / duration))
+                            _set_compress(key, phase="compressing", progress=min(0.99, seconds / duration),
+                                          doneSec=seconds, durSec=duration)
                     except (TypeError, ValueError):
                         pass
                 elif k == "progress" and v.strip() == "end":
@@ -1048,7 +1055,7 @@ def _compress_worker(key, model, tmp_path, file_name, target_res, target_fps, qu
                     raise UploadCancelled("上传已被取消")
                 if done - last_report[0] >= PROGRESS_WRITE_INTERVAL or done >= total:
                     last_report[0] = done
-                    _set_compress(key, phase="uploading", progress=done / max(1, total))
+                    _set_compress(key, phase="uploading", progress=done / max(1, total), uploaded=done, total=total)
 
             url = upload_file(api_key, base_url, model, out_path, os.path.basename(out_path),
                               "video/mp4", on_sent=on_sent)
