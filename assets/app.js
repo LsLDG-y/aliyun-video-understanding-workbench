@@ -6,7 +6,7 @@
 'use strict';
 
 /* ---------------- 版本 ---------------- */
-const APP_VERSION = '1.0';
+const APP_VERSION = '1.2';
 
 /* ---------------- 小工具 ---------------- */
 const $ = (sel) => document.querySelector(sel);
@@ -52,12 +52,22 @@ function fmtDate(ts) {
 }
 
 let toastTimer = null;
+/* 浏览器侧诊断日志：记录最近若干错误消息，供「导出诊断日志」合并使用 */
+const diagLogMax = 200;
+let diagLog = [];
+function pushDiag(msg) {
+  try {
+    diagLog.push({ ts: new Date().toLocaleString(), msg: String(msg) });
+    if (diagLog.length > diagLogMax) diagLog.shift();
+  } catch (_) {}
+}
 function toast(msg, type = '') {
   const t = $('#toast');
   t.textContent = msg;
   t.className = 'toast ' + type;
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => t.classList.add('hidden'), 3200);
+  if (type === 'err') pushDiag(msg);
 }
 
 /* 第一轮理解默认提示词：所有分支对话都基于此结果，尽量详尽（详细分镜脚本式） */
@@ -111,7 +121,7 @@ const MODEL_TIERS = {
   qwen37: { label: 'qwen3.7 系列', maxDuration: 7200, maxSizeMB: 2048, imgMax: 8000, tokenPixels: 1024, factor: 32, videoMaxPixels: 768 * 32 * 32, videoTotalPixels: 65536 * 32 * 32 },
   qwen36: { label: 'qwen3.6 系列', maxDuration: 7200, maxSizeMB: 2048, imgMax: 8000, tokenPixels: 1024, factor: 32, videoMaxPixels: 768 * 32 * 32, videoTotalPixels: 65536 * 32 * 32 },
   qwen35: { label: 'qwen3.5 系列', maxDuration: 7200, maxSizeMB: 2048, imgMax: 8000, tokenPixels: 1024, factor: 32, videoMaxPixels: 768 * 32 * 32, videoTotalPixels: 65536 * 32 * 32 },
-  omniPlus: { label: 'Qwen3.5-Omni-Plus（全模态旗舰）', maxDuration: 3600, maxSizeMB: 2048, imgMax: 2000, tokenPixels: 1024, factor: 32, videoMaxPixels: 768 * 32 * 32, videoTotalPixels: 65536 * 32 * 32 },
+  omniPlus: { label: 'Qwen3.5-Omni-Plus（全模态旗舰）', maxDuration: 3600, maxSizeMB: 1024, imgMax: 2000, tokenPixels: 1024, factor: 32, videoMaxPixels: 768 * 32 * 32, videoTotalPixels: 65536 * 32 * 32 },
   omniFlash: { label: 'Qwen3.5-Omni-Flash / Qwen3-Omni-Flash（全模态轻量）', maxDuration: 150, maxSizeMB: 1024, imgMax: 2000, tokenPixels: 1024, factor: 32, videoMaxPixels: 768 * 32 * 32, videoTotalPixels: 65536 * 32 * 32 },
   qwen3vlx: { label: 'qwen3-vl-plus / flash / 235b', maxDuration: 3600, maxSizeMB: 2048, imgMax: 2000, tokenPixels: 1024, factor: 32, videoMaxPixels: 640 * 32 * 32, videoTotalPixels: 131072 * 32 * 32 },
   qwen3vlo: { label: '其他 qwen3-vl 开源系列', maxDuration: 1200, maxSizeMB: 2048, imgMax: 512, tokenPixels: 1024, factor: 32, videoMaxPixels: 768 * 32 * 32, videoTotalPixels: 65536 * 32 * 32 },
@@ -438,6 +448,44 @@ const Api = {
       xhr.send(fd);
     });
   },
+  compress(file, model, settings, onProgress, onPhase, ctrl) {
+    /* 压缩：接收视频到本地服务 → 转码（可选并上传百炼）→ 返回结果。ctrl 支持取消 */
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/api/compress');
+      let settled = false;
+      const fail = (err) => { if (!settled) { settled = true; reject(err); } };
+      if (ctrl) ctrl.abortXhr = () => { ctrl.aborted = true; try { xhr.abort(); } catch (e) {} };
+      xhr.upload.onprogress = (e) => { if (e.lengthComputable && onProgress) onProgress(e.loaded / e.total); };
+      xhr.upload.onerror = () => fail(new Error('上传中断，请检查本地服务是否运行'));
+      xhr.onerror = () => fail(new Error('网络错误：无法连接本地服务'));
+      xhr.onabort = () => fail(new Error('已取消压缩'));
+      xhr.onload = () => {
+        let obj = null;
+        try { obj = JSON.parse(xhr.responseText); } catch (e) {}
+        if (xhr.status === 200 && obj && obj.ok && obj.compressKey) {
+          if (settled) return;
+          if (ctrl) ctrl.compressKey = obj.compressKey;
+          const abortCheck = () => {
+            if (!ctrl || !ctrl.aborted) return false;
+            fetch('/api/compress_cancel?key=' + encodeURIComponent(obj.compressKey), { method: 'POST', cache: 'no-store' }).catch(() => {});
+            return true;
+          };
+          pollCompress(obj.compressKey, (v) => { if (!settled) { settled = true; resolve(v); } }, (e) => fail(e), onPhase, abortCheck);
+        } else {
+          fail(new Error((obj && obj.error) || ('压缩失败 (HTTP ' + xhr.status + ')')));
+        }
+      };
+      const fd = new FormData();
+      fd.append('model', model);
+      fd.append('target_res', settings.targetRes || '720');
+      fd.append('target_fps', settings.targetFps || 'keep');
+      fd.append('quality', settings.quality || 'medium');
+      fd.append('auto_upload', settings.autoUpload ? '1' : '0');
+      fd.append('file', file, file.name);
+      xhr.send(fd);
+    });
+  },
   async models() {
     const r = await fetch('/api/models');
     const obj = await r.json();
@@ -541,6 +589,120 @@ async function pollTransit(key, resolve, reject, onTransit, abortCheck) {
     if (onTransit) onTransit({ phase, progress, waited, msg: '' });
     await new Promise((r) => setTimeout(r, 1000));
   }
+}
+
+/* 轮询服务端压缩进度：phase 为 received → probing → compressing → uploading → done / error / canceled */
+async function pollCompress(key, resolve, reject, onPhase, abortCheck) {
+  const t0 = Date.now();
+  const TOTAL_LIMIT = 60 * 60;    // 总上限（秒）1 小时
+  const STALL_LIMIT = 15 * 60;    // 无进展阈值（秒）
+  let lastProg = -1, lastChange = Date.now();
+  for (;;) {
+    if (abortCheck && abortCheck()) { reject(new Error('已取消压缩')); return; }
+    let s = null;
+    try {
+      const r = await fetch('/api/compress_status?key=' + encodeURIComponent(key), { cache: 'no-store' });
+      s = await r.json();
+    } catch (e) { /* 网络抖动，继续轮询 */ }
+    const phase = (s && s.phase) || 'received';
+    const progress = (s && s.progress) || 0;
+    const waited = Math.floor((Date.now() - t0) / 1000);
+    if (s && s.error) { reject(new Error(s.error)); return; }
+    if (phase === 'done' && s && s.result) {
+      if (onPhase) onPhase({ phase, progress: 1, waited, msg: '完成' });
+      resolve({ ...s.result, waited });
+      return;
+    }
+    if (phase === 'error') { reject(new Error((s && s.error) || '压缩失败')); return; }
+    if (phase === 'canceled') { reject(new Error('已取消压缩')); return; }
+    if (progress !== lastProg) { lastProg = progress; lastChange = Date.now(); }
+    const stalled = Math.floor((Date.now() - lastChange) / 1000);
+    if (waited > TOTAL_LIMIT) { reject(new Error('压缩超时（已等待 1 小时），请检查后重试')); return; }
+    if (waited > 60 && stalled > STALL_LIMIT) { reject(new Error('压缩停滞（15 分钟无进展），可能 ffmpeg 卡住，请重试')); return; }
+    if (onPhase) onPhase({ phase, progress, waited, msg: '' });
+    await new Promise((r2) => setTimeout(r2, 800));
+  }
+}
+
+/* ---------------- 视频压缩面板 ---------------- */
+let _cmpFile = null, _cmpCtrl = null, _cmpResult = null;
+function cmpPhaseLabel(p) {
+  return { received: '接收文件', probing: '分析视频', compressing: '压缩中', uploading: '上传到百炼', done: '完成', error: '出错', canceled: '已取消' }[p] || p;
+}
+function openCompress() {
+  if (!wiz.file) { toast('请先选择本地视频文件', 'err'); return; }
+  if (!state.settings.hasKey) { toast('未配置 API Key，无法压缩并上传', 'err'); return; }
+  if (!state.serverFfmpeg) { toast('未检测到 ffmpeg（请把 ffmpeg.exe 放入项目 ffmpeg\\ 文件夹）', 'err'); return; }
+  _cmpFile = wiz.file; _cmpCtrl = null; _cmpResult = null;
+  $('#cmpResult').classList.add('hidden');
+  $('#cmpStatusWrap').classList.add('hidden');
+  $('#cmpStart').classList.remove('hidden');
+  $('#cmpCancel').classList.add('hidden');
+  $('#cmpUse').classList.add('hidden');
+  $('#cmpBarFill').style.width = '0%';
+  $('#modalCompress').classList.remove('hidden');
+}
+async function startCompress() {
+  if (!_cmpFile) return;
+  const model = $('#wizModelSelect').value;
+  const settings = {
+    targetRes: $('#cmpRes').value, targetFps: $('#cmpFps').value,
+    quality: $('#cmpQuality').value, autoUpload: $('#cmpAutoUpload').checked,
+  };
+  $('#cmpStatusWrap').classList.remove('hidden');
+  $('#cmpResult').classList.add('hidden');
+  $('#cmpStart').classList.add('hidden');
+  $('#cmpCancel').classList.remove('hidden');
+  $('#cmpUse').classList.add('hidden');
+  const ctrl = { aborted: false, abortXhr: null, compressKey: null };
+  _cmpCtrl = ctrl;
+  $('#cmpCancel').onclick = () => { if (ctrl.abortXhr) ctrl.abortXhr(); };
+  try {
+    const r = await Api.compress(_cmpFile, model, settings, (p) => {
+      $('#cmpBarFill').style.width = Math.round(p * 100) + '%';
+      if (p < 1) $('#cmpStat').textContent = '上传文件到本地服务… ' + Math.round(p * 100) + '%';
+    }, ({ phase, progress, waited }) => {
+      const mm = String(Math.floor(waited / 60)).padStart(2, '0'), ss = String(waited % 60).padStart(2, '0');
+      $('#cmpStatus').textContent = cmpPhaseLabel(phase);
+      if (phase === 'done') { $('#cmpBarFill').style.width = '100%'; $('#cmpStat').textContent = '压缩完成 ✓'; }
+      else if (progress > 0) {
+        $('#cmpBarFill').style.width = Math.round(Math.max(2, progress * 100)) + '%';
+        $('#cmpStat').textContent = cmpPhaseLabel(phase) + ' ' + Math.round(progress * 100) + '% · 已等待 ' + mm + ':' + ss;
+      } else {
+        $('#cmpBarFill').style.width = '8%';
+        $('#cmpStat').textContent = cmpPhaseLabel(phase) + '… 已等待 ' + mm + ':' + ss;
+      }
+    }, ctrl);
+    _finishCompress(r);
+  } catch (e) {
+    $('#cmpStat').textContent = '失败：' + e.message;
+    $('#cmpBarFill').style.width = '0%';
+    $('#cmpStart').classList.remove('hidden');
+    $('#cmpCancel').classList.add('hidden');
+  }
+}
+function _finishCompress(r) {
+  let html = '压缩完成：' + (r.fileName || '') + '<br>';
+  if (r.width) html += r.width + '×' + r.height + (r.fps ? ' @' + r.fps.toFixed(1) + 'fps' : '') + ' · ' + fmtBytes(r.fileSize || 0);
+  if (r.url) html += '<br>已上传到百炼临时存储（48h 有效）';
+  else html += '<br><a href="/compressed/' + encodeURIComponent(r.path) + '" download>下载压缩结果</a>';
+  $('#cmpResult').innerHTML = html;
+  $('#cmpResult').classList.remove('hidden');
+  $('#cmpCancel').classList.add('hidden');
+  $('#cmpUse').classList.toggle('hidden', !r.url);
+  _cmpResult = r.url ? r : null;
+}
+function useCompressResult() {
+  if (!_cmpResult || !_cmpResult.url) return;
+  wiz.uploadResult = _cmpResult;
+  wiz.meta = { name: _cmpResult.fileName, size: _cmpResult.fileSize, duration: _cmpResult.duration, width: _cmpResult.width, height: _cmpResult.height, fps: _cmpResult.fps };
+  $('#modalCompress').classList.add('hidden');
+  toast('已应用压缩结果，点「开始理解」继续', 'ok');
+  renderEstimate();
+  $('#uploadPanel').classList.remove('hidden');
+  $('#upName').textContent = _cmpResult.fileName || '视频';
+  $('#upStat').textContent = '压缩已上传 ✓ 临时链接 48 小时有效';
+  $('#upBarFill').style.width = '100%';
 }
 
 /* ---------------- 全局状态 ---------------- */
@@ -1069,7 +1231,7 @@ function updateEstimateUI() {
   rows.push(['抽帧频率', fps + ' fps']);
   const pr = effPrice(model);
   if (pr.in != null) {
-    rows.push(['预估输入费用', '≈ ¥' + ((total / 1000) * pr.in).toFixed(4) + '（单价 ¥' + pr.in.toFixed(3) + '/千Token，输出另计）']);
+    rows.push(['输入费（理解视频＋提示词）', '≈ ¥' + ((total / 1000) * pr.in).toFixed(4) + '（单价 ¥' + pr.in.toFixed(3) + '/千Token）']);
   }
   $('#estimateTable').innerHTML = `
     <table><thead><tr><th>项目</th><th style="width:60%">值</th></tr></thead>
@@ -1091,7 +1253,24 @@ function updateEstimateUI() {
   if (wiz.uploadResult && wiz.uploadResult.url) warns.push(['已上传，临时链接有效期至 ' + fmtDate(nowMs() + 48 * 3600 * 1000) + '（48 小时）；过期后对话中附带视频需重新上传', false]);
   if (wiz.url && wiz.url.warning) warns.push(['URL 校验：' + wiz.url.warning, false]);
   if (wiz.url && (duration == null)) warns.push(['公网 URL 视频的时长 / 分辨率未知，上述估算按默认值计算，可能偏差较大；实际消耗以每次 API 返回的 usage 为准', false]);
+  if (pr.in != null || pr.out != null) {
+    warns.push(['⚠ 以上仅为「输入（理解视频＋提示词）」费用；「输出（模型回答）」消耗无法估算，受视频内容与回答篇幅影响较大。实际总费用以每次 API 返回的 usage 为准（无免费额度时按实时计费）。', false]);
+  }
+  if (pr.in != null && duration != null && duration > 180) {
+    warns.push(['📌 参考：一部约 10 分钟 1080p 纪录片，用全模态旗舰 + 默认详细分镜提示词，输入约 ¥0.4，加上输出后单轮实际常达 ¥2~3（以输出为主、难预估）。长视频建议：降低抽帧 fps、精简提示词，或改用更便宜的视觉模型（如 qwen3-vl-plus / qwen-vl-plus 系列）。', false]);
+  }
   $('#warnList').innerHTML = warns.map(([t, isErr]) => `<div class="warn-item${isErr ? ' err' : ''}">${t}</div>`).join('');
+  /* 压缩入口：仅本地文件、未上传、且检测到 ffmpeg 时可用 */
+  const canCompress = !!wiz.file && !(wiz.uploadResult && wiz.uploadResult.url);
+  const cmpRow = $('#wizCompressRow');
+  if (cmpRow) {
+    cmpRow.classList.toggle('hidden', !canCompress);
+    const cmpBtn = $('#btnWizCompress');
+    if (cmpBtn) {
+      cmpBtn.disabled = !state.serverFfmpeg;
+      cmpBtn.title = state.serverFfmpeg ? '先压缩减小体积，以通过百炼 1GB 上传上限' : '未检测到 ffmpeg，无法压缩';
+    }
+  }
   $('#wizProjectName').value = $('#wizProjectName').value || (wiz.file ? wiz.file.name.replace(/\.[^.]+$/, '') : (wiz.url ? 'URL 视频' : ''));
 }
 
@@ -1688,6 +1867,42 @@ async function exportData() {
   toast('已导出 ' + projects.length + ' 个项目', 'ok');
 }
 
+/* 导出诊断日志：合并服务端 server.log + 本次会话浏览器侧捕获的错误，生成可发送的 .txt
+   （绝不包含 API Key） */
+async function exportDiagnosticLog() {
+  let serverLines = [], serverErr = '';
+  try {
+    const r = await fetch('/api/log', { cache: 'no-store' });
+    const j = await r.json();
+    serverLines = (j && Array.isArray(j.entries)) ? j.entries : [];
+  } catch (e) {
+    serverErr = '（无法读取服务端日志：' + ((e && e.message) || e) + '，请确认本地服务已启动）';
+  }
+  const L = [];
+  L.push('================ 视频理解工作台 · 诊断日志 ================');
+  L.push('导出时间: ' + new Date().toLocaleString());
+  L.push('应用版本: v' + APP_VERSION);
+  L.push('服务端地址: ' + (state.settings.baseUrl || '（未知）'));
+  L.push('已配置 API Key: ' + (state.settings.hasKey ? '是' : '否'));
+  L.push('');
+  L.push('---- 服务端日志（server.log 最近 200 行）----');
+  if (serverErr) L.push(serverErr);
+  else if (serverLines.length) L.push.apply(L, serverLines);
+  else L.push('（服务端日志为空）');
+  L.push('');
+  L.push('---- 本次会话前端捕获的错误 ----');
+  if (!diagLog.length) L.push('（无）');
+  else diagLog.forEach(x => L.push('[' + x.ts + '] ' + x.msg));
+  const text = L.join('\r\n');
+  const blob = new Blob(['\ufeff' + text], { type: 'text/plain;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = '诊断日志-' + fmtDate(nowMs()) + '.txt';
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+  toast('已导出诊断日志', 'ok');
+}
+
 async function importData(file) {
   const text = await file.text();
   let data;
@@ -1724,6 +1939,8 @@ async function refreshHealth(silent) {
     state.serverOk = true;
     state.settings.hasKey = h.hasKey;
     state.settings.baseUrl = h.baseUrl;
+    state.serverFfmpeg = !!h.ffmpeg;
+    state.serverFfmpegVersion = h.ffmpegVersion || null;
     try { const cfg = await Api.config(); state.settings.priceIn = cfg.priceIn; state.settings.priceOut = cfg.priceOut; } catch (e) { /* ignore */ }
   } catch (e) {
     state.serverOk = false;
@@ -1957,6 +2174,7 @@ function bindEvents() {
   const settingsSaveBtn = document.querySelector('#modalSettings .modal-foot .btn-primary');
   if (settingsSaveBtn) settingsSaveBtn.addEventListener('click', saveSettings);
   $('#btnExportData').addEventListener('click', exportData);
+  $('#btnExportLog').addEventListener('click', exportDiagnosticLog);
   $('#btnImportData').addEventListener('click', () => $('#importFileInput').click());
   $('#importFileInput').addEventListener('change', (e) => {
     const f = e.target.files && e.target.files[0];
@@ -1964,6 +2182,11 @@ function bindEvents() {
     e.target.value = '';
   });
   $('#btnClearAll').addEventListener('click', clearAllData);
+
+  /* 视频压缩面板 */
+  $('#btnWizCompress').addEventListener('click', openCompress);
+  $('#cmpStart').addEventListener('click', startCompress);
+  $('#cmpUse').addEventListener('click', useCompressResult);
 
   /* 确认框 */
   $('#confirmOk').addEventListener('click', () => {

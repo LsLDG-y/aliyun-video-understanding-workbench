@@ -15,9 +15,12 @@
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 import threading
+import traceback
 import webbrowser
 import urllib.error
 import urllib.parse
@@ -37,7 +40,7 @@ if sys.version_info < (3, 8):
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(ROOT, "config.json")
 HOST = "127.0.0.1"
-VERSION = "1.0"
+VERSION = "1.2"
 PREFERRED_PORTS = [8686, 8687, 8688, 8689, 8690, 8710]
 DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com"
 UPLOAD_API = "/api/v1/uploads"
@@ -54,6 +57,7 @@ MIME = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
     ".ico": "image/x-icon",
+    ".mp4": "video/mp4",
     ".woff2": "font/woff2",
 }
 
@@ -178,6 +182,59 @@ def _trunc(s, n=300):
     return s if len(s) <= n else s[:n] + "…（已截断）"
 
 
+# ---------------------------------------------------------------- 本地日志（server.log）
+# 只记录错误与关键运行节点，避免无限增长；超过体积/行数上限时自动裁掉最前面的旧记录。
+LOG_PATH = os.path.join(ROOT, "server.log")
+LOG_MAX_BYTES = 512 * 1024   # 日志文件体积上限（512KB）
+LOG_MAX_LINES = 800          # 超过上限时保留的最近行数
+LOG_CHECK_EVERY = 64         # 每写入多少条后检查一次体积（降低频繁读盘开销）
+_LOG_LOCK = threading.Lock()
+_LOG_WRITES = [0]
+
+
+def _log(level, msg):
+    line = "%s [%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), level, msg)
+    with _LOG_LOCK:
+        try:
+            with open(LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(line)
+            _LOG_WRITES[0] += 1
+            if _LOG_WRITES[0] >= LOG_CHECK_EVERY:
+                _LOG_WRITES[0] = 0
+                _rotate_log()
+        except OSError:
+            pass  # 日志写失败不影响主流程
+
+
+def _rotate_log():
+    """日志超限：只保留最近 LOG_MAX_LINES 行，丢弃更旧的部分"""
+    try:
+        if not os.path.exists(LOG_PATH):
+            return
+        if os.path.getsize(LOG_PATH) <= LOG_MAX_BYTES:
+            return
+        with open(LOG_PATH, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        keep = lines[-LOG_MAX_LINES:] if len(lines) > LOG_MAX_LINES else lines
+        if len(keep) < len(lines):
+            with open(LOG_PATH, "w", encoding="utf-8") as f:
+                f.writelines(keep)
+    except OSError:
+        pass
+
+
+def _log_tail(n=200):
+    """返回 server.log 最近 n 行（用于 /api/log 导出）"""
+    try:
+        if not os.path.exists(LOG_PATH):
+            return []
+        with open(LOG_PATH, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        return [ln.rstrip("\n") for ln in lines[-n:]]
+    except OSError:
+        return []
+
+
 def upload_file(api_key, base_url, model, file_path, file_name, content_type, on_sent=None):
     """上传视频文件到百炼临时存储，返回 oss:// URL（on_sent: 已发送字节/总字节回调）
 
@@ -206,7 +263,26 @@ def upload_file(api_key, base_url, model, file_path, file_name, content_type, on
             last_err = "网络异常: %s" % _trunc(e)
         time.sleep(1 + attempt)  # 退避 1s / 2s
     if policy is None:
+        _log("ERROR", "获取上传凭证失败（3 次尝试）: %s" % last_err)
         raise RuntimeError("获取上传凭证失败（%d 次尝试）: %s" % (3, last_err))
+
+    # 大小前置校验：百炼临时 OSS 对每个模型有上传大小上限（getPolicy 返回 max_file_size_mb）。
+    # 若不校验直接上传，超出会被 OSS 以 400 "Bad Request" 拒绝，用户只看到晦涩报错。
+    # 这里在真正向 OSS 发送文件前拦截，并给出可读的限额与建议。
+    limit_mb = policy.get("max_file_size_mb")
+    if limit_mb not in (None, "", "0", 0):
+        try:
+            limit_mb = float(limit_mb)
+        except (TypeError, ValueError):
+            limit_mb = None
+        if limit_mb:
+            fsize = os.path.getsize(file_path) / (1024 * 1024)
+            if fsize > limit_mb:
+                _log("ERROR", "上传大小超限: 文件 %.1f MB > 模型 %s 的 %.0f MB 上限" % (fsize, model, limit_mb))
+                raise RuntimeError(
+                    "视频文件（%.1f MB）超过该模型允许的上传大小上限（%.0f MB）。"
+                    "请压缩/转码视频后再试；若视频在公网可访问，也可改用公网视频 URL 跳过上传。" % (fsize, limit_mb))
+            _log("INFO", "上传大小校验通过（%.1f MB ≤ %.0f MB），模型 %s" % (fsize, limit_mb, model))
 
     key = "%s/%s" % (policy["upload_dir"].rstrip("/"), file_name)
     fields = {
@@ -226,10 +302,23 @@ def upload_file(api_key, base_url, model, file_path, file_name, content_type, on
         resp = urllib.request.urlopen(req, timeout=3600)
         resp.read()
         status = resp.status
+    except urllib.error.HTTPError as e:
+        eb = ""
+        try:
+            eb = e.read().decode("utf-8", "replace")
+        except Exception:
+            pass
+        _log("ERROR", "OSS 上传被拒 HTTP %s: %s\nbody: %s" % (e.code, e.reason, _trunc(eb, 800)))
+        raise
+    except Exception as e:  # noqa: BLE001
+        _log("ERROR", "OSS 上传异常: %s\n%s" % (e, traceback.format_exc()))
+        raise
     finally:
         body.close()
     if status != 200:
+        _log("ERROR", "OSS 上传返回 HTTP %s" % status)
         raise RuntimeError("上传文件到临时存储失败: HTTP %s" % status)
+    _log("INFO", "OSS 上传成功: oss://%s" % key)
     return "oss://" + key
 
 
@@ -304,8 +393,9 @@ class Handler(BaseHTTPRequestHandler):
             self._server_error(e)
 
     def _server_error(self, e):
-        import traceback
+        tb = traceback.format_exc()
         traceback.print_exc()
+        _log("ERROR", "服务器内部错误: %s\n%s" % (e, tb))
         try:
             self.send_json({"error": "服务器内部错误: %s" % e}, 500)
         except Exception:
@@ -313,11 +403,15 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- API: GET
     def api_get(self, path, parsed):
+        if path == "/api/log":
+            return self.send_json({"entries": _log_tail(200)})
         if path == "/api/health":
             return self.send_json({
                 "ok": True, "version": VERSION,
                 "hasKey": bool(CONFIG.get("apiKey")),
                 "baseUrl": CONFIG.get("baseUrl", DEFAULT_BASE_URL),
+                "ffmpeg": bool(_find_ffmpeg()),
+                "ffmpegVersion": _ffmpeg_version(),
             })
         if path == "/api/config":
             return self.send_json({
@@ -331,6 +425,17 @@ class Handler(BaseHTTPRequestHandler):
             st = _upload_state(key) if key else None
             if st is None:
                 return self.send_json({"error": "未知的上传任务"}, 404)
+            return self.send_json({
+                "phase": st.get("phase", "received"),
+                "progress": st.get("progress", 0),
+                "result": st.get("result"),
+                "error": st.get("error"),
+            })
+        if path == "/api/compress_status":
+            key = (parsed.query and dict(urllib.parse.parse_qsl(parsed.query)).get("key")) or ""
+            st = _compress_state(key) if key else None
+            if st is None:
+                return self.send_json({"error": "未知的压缩任务"}, 404)
             return self.send_json({
                 "phase": st.get("phase", "received"),
                 "progress": st.get("progress", 0),
@@ -463,6 +568,7 @@ class Handler(BaseHTTPRequestHandler):
                 parser.cleanup()
             if parse_err is not None:
                 _remove_tmp(tmp_path)
+                _log("WARN", "上传解析失败: %s" % parse_err)
                 return self.send_json({"error": parse_err}, 400)
             if not file_name:
                 _remove_tmp(tmp_path)
@@ -495,6 +601,78 @@ class Handler(BaseHTTPRequestHandler):
             # 幂等：任务不存在/已结束也视为"已取消"，避免前端取消竞态报错
             return self.send_json({"ok": True, "cancelled": True})
 
+        if path == "/api/compress_cancel":
+            key = (parsed.query and dict(urllib.parse.parse_qsl(parsed.query)).get("key")) or ""
+            if key:
+                _set_compress(key, cancel=True)
+            return self.send_json({"ok": True, "cancelled": True})
+
+        if path == "/api/compress":
+            # 接收源视频 multipart → 落盘 → 后台压缩（探测/ffmpeg/可选上传），类似 /api/upload 的两阶段模型
+            content_type = self.headers.get("Content-Type", "")
+            m = re.search(r'boundary=([^;]+)', content_type)
+            length = int(self.headers.get("Content-Length") or 0)
+            if not m:
+                return self.send_json({"error": "需要 multipart/form-data 请求"}, 400)
+            if length <= 0:
+                return self.send_json({"error": "缺少 Content-Length"}, 400)
+            boundary = m.group(1).strip().strip('"')
+            tmp_path = os.path.join(ROOT, "tmp_compress_%s_%s.bin" % (os.getpid(), uuid_like().hex[:12]))
+            parser = MultipartParser(self.rfile, length, boundary)
+            parser.file_sink = lambda fn: open(tmp_path, "wb")
+            fname = None
+            fsize = 0
+            model = ""
+            target_res = "720"
+            target_fps = "keep"
+            quality = "medium"
+            auto_upload = True
+            parse_err = None
+            try:
+                for part in parser.read():
+                    if part["filename"] is not None:
+                        fname = part["filename"]
+                        fsize = part["size"]
+                    elif part["name"] == "model":
+                        model = part["data"].decode("utf-8", "replace").strip()
+                    elif part["name"] == "target_res":
+                        target_res = part["data"].decode("utf-8", "replace").strip() or "720"
+                    elif part["name"] == "target_fps":
+                        target_fps = part["data"].decode("utf-8", "replace").strip() or "keep"
+                    elif part["name"] == "quality":
+                        quality = part["data"].decode("utf-8", "replace").strip() or "medium"
+                    elif part["name"] == "auto_upload":
+                        auto_upload = (part["data"].decode("utf-8", "replace").strip() or "1") not in ("0", "false", "no")
+            except (ValueError, OSError) as e:
+                parse_err = "压缩上传中断或请求格式异常: %s" % e
+            finally:
+                parser.cleanup()
+            if parse_err is not None:
+                _remove_tmp(tmp_path)
+                _log("WARN", "压缩上传解析失败: %s" % parse_err)
+                return self.send_json({"error": parse_err}, 400)
+            if not fname:
+                _remove_tmp(tmp_path)
+                return self.send_json({"error": "未找到文件字段"}, 400)
+            fname = re.sub(r'[\\/:\x00-\x1f"<>|]', "_", fname)
+            if target_res not in ("keep", "1080", "720", "480"):
+                target_res = "720"
+            if target_fps not in ("keep", "30", "60"):
+                target_fps = "keep"
+            if quality not in ("low", "medium", "high"):
+                quality = "medium"
+            if not _find_ffmpeg():
+                _remove_tmp(tmp_path)
+                return self.send_json(
+                    {"error": "未检测到 ffmpeg，无法压缩（请将 ffmpeg.exe 放入项目 ffmpeg\\ 文件夹，或加入 PATH）"}, 400)
+            key = uuid_like().hex
+            _set_compress(key, phase="received", progress=0.0, error=None)
+            threading.Thread(target=_compress_worker,
+                             args=(key, model, tmp_path, fname, target_res, target_fps, quality,
+                                   auto_upload, cfg.get("apiKey"), cfg["baseUrl"]),
+                             daemon=True).start()
+            return self.send_json({"ok": True, "compressKey": key, "fileSize": fsize, "fileName": fname})
+
         if path == "/api/chat":
             if not cfg.get("apiKey"):
                 return self.send_json({"error": "未配置 API Key，请先在设置中填写"}, 400)
@@ -508,6 +686,7 @@ class Handler(BaseHTTPRequestHandler):
                 resp = urllib.request.urlopen(req, timeout=1800)
             except urllib.error.HTTPError as e:
                 err_body = e.read().decode("utf-8", "replace")
+                _log("ERROR", "对话接口返回 HTTP %s: %s" % (e.code, err_body))
                 return self.send_json({"error": "百炼接口返回 HTTP %s: %s" % (e.code, _trunc(err_body, 500))}, e.code)
             except urllib.error.URLError as e:
                 return self.send_json({"error": "无法连接百炼接口: %s" % _trunc(e.reason, 300)}, 502)
@@ -597,6 +776,7 @@ def _oss_upload_worker(key, model, tmp_path, file_name, api_key, base_url, conte
     """后台执行：获取凭证 + 上传到百炼临时 OSS，进度写入 _UPLOADS[key]（支持取消）"""
     try:
         _set_upload(key, phase="presign", progress=0, error=None)
+        _log("INFO", "转存开始 key=%s 模型=%s 文件=%s（%d bytes）" % (key, model, file_name, os.path.getsize(tmp_path)))
         last_report = [0]
 
         def on_sent(done, total):
@@ -614,10 +794,13 @@ def _oss_upload_worker(key, model, tmp_path, file_name, api_key, base_url, conte
                     result={"url": url, "fileName": file_name,
                             "fileSize": os.path.getsize(tmp_path),
                             "expireInSeconds": 48 * 3600})
+        _log("INFO", "转存完成 key=%s -> %s" % (key, url))
     except UploadCancelled:
         _set_upload(key, phase="canceled", progress=0, error=None)
+        _log("WARN", "上传已取消 key=%s" % key)
     except Exception as e:  # noqa: BLE001
         _set_upload(key, phase="error", error=_trunc(e))
+        _log("ERROR", "转存失败 key=%s: %s\n%s" % (key, e, traceback.format_exc()))
     finally:
         _remove_tmp(tmp_path)
 
@@ -633,6 +816,263 @@ def _remove_tmp(path):
 PROGRESS_WRITE_INTERVAL = 256 * 1024
 
 
+# ---------------------------------------------------------------- 视频压缩（ffmpeg 子进程）
+_CREATEFLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # Windows：避免弹出黑色控制台窗口
+_COMPRESS = {}
+_COMPRESS_LOCK = threading.Lock()
+
+
+def _compress_state(key):
+    with _COMPRESS_LOCK:
+        return _COMPRESS.get(key)
+
+
+def _set_compress(key, **kw):
+    with _COMPRESS_LOCK:
+        st = _COMPRESS.setdefault(key, {})
+        st.update(kw)
+        st["ts"] = time.time()
+        if len(_COMPRESS) > 200:
+            old = [k for k, v in _COMPRESS.items() if time.time() - v.get("ts", 0) > 3600]
+            for k in old:
+                _COMPRESS.pop(k, None)
+
+
+def _find_ffmpeg():
+    """返回 ffmpeg.exe 绝对路径；找不到返回 None。顺序：项目 ffmpeg\\ffmpeg.exe → 项目根 ffmpeg.exe → PATH"""
+    cands = [
+        os.path.join(ROOT, "ffmpeg", "ffmpeg.exe"),
+        os.path.join(ROOT, "ffmpeg.exe"),
+        shutil.which("ffmpeg"),
+    ]
+    for c in cands:
+        if c and os.path.isfile(c):
+            return c
+    return None
+
+
+_FFMPEG_VER_CACHE = [None, 0.0]
+
+
+def _ffmpeg_version():
+    """返回 ffmpeg 版本首行（带 5 分钟缓存）"""
+    path = _find_ffmpeg()
+    if not path:
+        _FFMPEG_VER_CACHE[0] = None
+        return None
+    if time.time() - _FFMPEG_VER_CACHE[1] > 300:
+        try:
+            p = subprocess.Popen([path, "-version"], stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL, creationflags=_CREATEFLAGS)
+            out = p.communicate(timeout=10)[0].decode("utf-8", "replace")
+            p.wait(timeout=5)
+            first = [l for l in out.splitlines() if l.strip()]
+            _FFMPEG_VER_CACHE[0] = first[0].strip() if first else None
+        except Exception:
+            _FFMPEG_VER_CACHE[0] = None
+        _FFMPEG_VER_CACHE[1] = time.time()
+    return _FFMPEG_VER_CACHE[0]
+
+
+def _probe_video(ffmpeg, path):
+    """用 `ffmpeg -i` 读取宽高/帧率/时长/是否有音轨（不输出文件）"""
+    info = {"width": None, "height": None, "fps": None, "duration": None, "has_audio": False}
+    try:
+        p = subprocess.Popen([ffmpeg, "-hide_banner", "-i", path],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                             creationflags=_CREATEFLAGS)
+        err = p.communicate(timeout=30)[1].decode("utf-8", "replace")
+        p.wait(timeout=5)
+    except Exception:
+        return info
+    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", err)
+    if m:
+        hh, mm, ss = int(m.group(1)), int(m.group(2)), float(m.group(3))
+        info["duration"] = hh * 3600 + mm * 60 + ss
+    vid = ""
+    for line in err.splitlines():
+        if "Video:" in line:
+            vid = line
+            break
+    if vid:
+        m = re.search(r"(\d{2,5})x(\d{2,5})\s*\[", vid)   # 优先：紧跟 [SAR…DAR…] 的分辨率
+        if not m:
+            m = re.search(r"(\d{2,5})x(\d{2,5})", vid)
+        if m:
+            info["width"], info["height"] = int(m.group(1)), int(m.group(2))
+        m = re.search(r"(\d+(?:\.\d+)?)\s*fps", vid)
+        if m:
+            info["fps"] = float(m.group(1))
+    info["has_audio"] = bool(re.search(r"Audio:", err))
+    return info
+
+
+def _build_ffmpeg_args(ffmpeg, src, dst, target_res, target_fps, quality, info):
+    """组装 ffmpeg 参数：只降不提（分辨率/帧率不放大）、宽高比不变、偶数尺寸、yuv420p 兼容、保留音频"""
+    args = [ffmpeg, "-y", "-hide_banner", "-i", src]
+    vf = []
+    box = {"1080": (1920, 1080), "720": (1280, 720), "480": (854, 480)}.get(target_res)
+    if box and info.get("width") and info.get("height"):
+        vf.append("scale=w=%d:h=%d:force_original_aspect_ratio=decrease:force_divisible_by=2"
+                  % (box[0], box[1]))
+    eff_fps = None
+    if target_fps != "keep" and info.get("fps"):
+        try:
+            t = int(target_fps)
+            if t > 0 and t < info["fps"]:
+                eff_fps = t
+        except (TypeError, ValueError):
+            pass
+    if vf:
+        args += ["-vf", ",".join(vf)]
+    crf = {"low": "28", "medium": "23", "high": "18"}.get(quality, "23")
+    preset = "slow" if quality == "high" else "medium"
+    args += ["-c:v", "libx264", "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p"]
+    if eff_fps:
+        args += ["-r", str(eff_fps)]
+    args += ["-c:a", "aac", "-b:a", "128k"]
+    args += [dst]
+    return args
+
+
+def _run_ffmpeg(args, key, duration):
+    """带进度的 ffmpeg 运行，进度写 _COMPRESS[key]，支持取消。成功返回，失败抛 RuntimeError。"""
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, encoding="utf-8", errors="replace",
+                            bufsize=1, creationflags=_CREATEFLAGS)
+    err_tail = []
+    try:
+        for line in iter(proc.stdout.readline, ""):
+            line = line.rstrip("\r\n")
+            if "=" in line and not line.startswith("["):
+                k, _, v = line.partition("=")
+                if k in ("out_time_us", "out_time_ms"):
+                    try:
+                        seconds = int(v) / 1e6
+                        if duration:
+                            _set_compress(key, phase="compressing", progress=min(0.99, seconds / duration))
+                    except (TypeError, ValueError):
+                        pass
+                elif k == "progress" and v.strip() == "end":
+                    _set_compress(key, phase="compressing", progress=0.99)
+            else:
+                err_tail.append(line)
+                if len(err_tail) > 60:
+                    err_tail.pop(0)
+            st = _COMPRESS.get(key)
+            if st and st.get("cancel"):
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+                raise UploadCancelled("压缩已被取消")
+    except UploadCancelled:
+        raise
+    finally:
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=15)
+    except Exception:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    if proc.returncode != 0:
+        tail = "\n".join(err_tail[-20:])
+        raise RuntimeError("ffmpeg 压缩失败（退出码 %s）：%s" % (proc.returncode, _trunc(tail, 500)))
+
+
+def _compress_worker(key, model, tmp_path, file_name, target_res, target_fps, quality,
+                     auto_upload, api_key, base_url):
+    """后台：探测 → ffmpeg 压缩 → (可选)上传百炼临时 OSS。进度写 _COMPRESS[key]（支持取消）。
+    成功保留 compressed/ 成品；取消/失败清理源临时文件与半成品输出。"""
+    ffmpeg = _find_ffmpeg()
+    out_dir = os.path.join(ROOT, "compressed")
+    out_path = None
+    try:
+        if not ffmpeg:
+            raise RuntimeError("未找到 ffmpeg（请确认项目内 ffmpeg\\ffmpeg.exe 存在）。")
+        os.makedirs(out_dir, exist_ok=True)
+        safe_base = re.sub(r'[\\/:\x00-\x1f"<>|]', "_", os.path.splitext(file_name)[0]) or "video"
+        tip = "%s-%s" % (target_res if target_res in ("1080", "720", "480") else "src",
+                         target_fps if target_fps != "keep" else "srcfps")
+        out_name = "%s_%s.mp4" % (safe_base, tip)
+        out_path = os.path.join(out_dir, out_name)
+        n = 1
+        while os.path.exists(out_path):
+            out_path = os.path.join(out_dir, "%s_%d_%s.mp4" % (safe_base, n, tip))
+            n += 1
+
+        _log("INFO", "压缩开始 key=%s 文件=%s 目标=%s/%s 质量=%s auto=%s" %
+             (key, file_name, target_res, target_fps, quality, auto_upload))
+        _set_compress(key, phase="probing", progress=0.0, error=None)
+        info = _probe_video(ffmpeg, tmp_path)
+        _log("INFO", "压缩探测 key=%s 尺寸=%sx%s fps=%s dur=%s 音轨=%s" %
+             (key, info["width"], info["height"], info["fps"], info["duration"], info["has_audio"]))
+        if info["width"] is None:
+            raise RuntimeError("无法读取该视频的信息，请确认是有效的视频文件。")
+        if not info["has_audio"]:
+            _log("WARN", "源视频无音轨，压缩输出将无声音（如需声音请用带声源视频）。")
+
+        args = _build_ffmpeg_args(ffmpeg, tmp_path, out_path, target_res, target_fps, quality, info)
+        _log("INFO", "压缩命令 key=%s: %s" % (key, " ".join(args)))
+        _set_compress(key, phase="compressing", progress=0.0, error=None)
+        _run_ffmpeg(args, key, info["duration"])
+        _set_compress(key, phase="compressing", progress=1.0, error=None)
+
+        out_info = _probe_video(ffmpeg, out_path)  # 读取压缩后成品的真实规格
+        out_size = os.path.getsize(out_path)
+        result = {"fileName": os.path.basename(out_path), "fileSize": out_size,
+                  "width": out_info["width"] or info["width"],
+                  "height": out_info["height"] or info["height"],
+                  "fps": out_info["fps"] or info["fps"],
+                  "duration": out_info["duration"] or info["duration"],
+                  "path": os.path.basename(out_path)}
+        _log("INFO", "压缩完成 key=%s 输出=%s 大小=%d bytes" % (key, out_path, out_size))
+
+        if auto_upload:
+            if not api_key:
+                raise RuntimeError("未配置 API Key，可先在设置中填写后再压缩上传。")
+            if not model:
+                raise RuntimeError("缺少 model 参数。")
+            _set_compress(key, phase="uploading", progress=0.0, error=None)
+            last_report = [0]
+
+            def on_sent(done, total):
+                st = _COMPRESS.get(key)
+                if st and st.get("cancel"):
+                    raise UploadCancelled("上传已被取消")
+                if done - last_report[0] >= PROGRESS_WRITE_INTERVAL or done >= total:
+                    last_report[0] = done
+                    _set_compress(key, phase="uploading", progress=done / max(1, total))
+
+            url = upload_file(api_key, base_url, model, out_path, os.path.basename(out_path),
+                              "video/mp4", on_sent=on_sent)
+            result["url"] = url
+            result["expireInSeconds"] = 48 * 3600
+            _log("INFO", "压缩后上传成功 key=%s -> %s" % (key, url))
+
+        _set_compress(key, phase="done", progress=1.0, result=result)
+    except UploadCancelled:
+        _set_compress(key, phase="canceled", progress=0, error=None)
+        _log("WARN", "压缩已取消 key=%s" % key)
+    except Exception as e:  # noqa: BLE001
+        _set_compress(key, phase="error", error=_trunc(e))
+        _log("ERROR", "压缩失败 key=%s: %s\n%s" % (key, e, traceback.format_exc()))
+    finally:
+        _remove_tmp(tmp_path)
+        st = _COMPRESS.get(key) or {}
+        if st.get("phase") != "done" and out_path and os.path.exists(out_path):
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
+
+
 def mime_for_file(name):
     ext = os.path.splitext(name or "")[1].lower()
     return {
@@ -644,10 +1084,10 @@ def mime_for_file(name):
 
 
 def cleanup_stale_uploads():
-    """清理上次异常退出遗留的 tmp_upload_*.bin（超过 1 小时未更新的残留文件）"""
+    """清理上次异常退出遗留的 tmp_upload_*.bin / tmp_compress_*.bin（超过 1 小时未更新的残留文件）"""
     import glob
     try:
-        for p in glob.glob(os.path.join(ROOT, "tmp_upload_*.bin")):
+        for p in glob.glob(os.path.join(ROOT, "tmp_upload_*.bin")) + glob.glob(os.path.join(ROOT, "tmp_compress_*.bin")):
             try:
                 if time.time() - os.path.getmtime(p) > 3600:
                     os.remove(p)
@@ -806,6 +1246,7 @@ def main():
     print("  访问地址: %s" % url)
     print("  按 Ctrl+C 停止服务")
     print("=" * 56)
+    _log("INFO", "服务启动 v%s，端口 %s" % (VERSION, port))
 
     def opener():
         time.sleep(0.8)

@@ -21,7 +21,7 @@
   <div class="topbar-actions">
     <div id="serverBadge" class="badge badge-warn" title="正在检测本地服务">服务检测中…</div>
     <div id="apiKeyBadge" class="badge badge-warn" title="尚未在设置中配置 API Key">未配置 API Key</div>
-    <span id="appVersion" class="badge badge-version" title="版本">v1.0</span>
+    <span id="appVersion" class="badge badge-version" title="版本">v1.2</span>
     <button id="btnSettings" class="btn btn-ghost" title="设置">⚙ 设置</button>
   </div>
 </header>
@@ -220,6 +220,9 @@
         <div id="estimateCards" class="estimate-cards"></div>
         <div id="estimateTable" class="estimate-table"></div>
         <div id="warnList" class="warn-list"></div>
+        <div class="compress-row" id="wizCompressRow" style="margin-top:10px">
+          <button id="btnWizCompress" class="btn btn-ghost btn-sm" title="先压缩减小体积，以通过百炼 1GB 上传上限">⬇ 压缩（减小体积，避免超 1GB）</button>
+        </div>
         <label class="field" style="margin-top:14px">
           <span>项目名称 <i class="hint">默认为视频文件名</i></span>
           <input id="wizProjectName" class="input" placeholder="如：产品宣传片-理解">
@@ -247,6 +250,66 @@
           <button id="wizStart" class="btn btn-primary hidden">🚀 开始理解</button>
         </div>
       </div>
+    </div>
+  </div>
+</div>
+
+<!-- ======= 视频压缩 ======= -->
+<div id="modalCompress" class="modal-mask hidden">
+  <div class="modal">
+    <div class="modal-head">
+      <h2>压缩视频</h2>
+      <button class="modal-close" data-close="modalCompress">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="price-grid">
+        <label class="field">
+          <span>分辨率</span>
+          <select id="cmpRes" class="input">
+            <option value="keep">保持原分辨率</option>
+            <option value="1080">1080p</option>
+            <option value="720" selected>720p</option>
+            <option value="480">480p</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>帧率</span>
+          <select id="cmpFps" class="input">
+            <option value="keep" selected>保持原帧率</option>
+            <option value="60">60 fps</option>
+            <option value="30">30 fps</option>
+          </select>
+        </label>
+      </div>
+      <label class="field">
+        <span>质量 <i class="hint">越小体积越小、越省</i></span>
+        <select id="cmpQuality" class="input">
+          <option value="low">低（CRF 28，体积最小）</option>
+          <option value="medium" selected>中（CRF 23）</option>
+          <option value="high">高（CRF 18，画质好体积大）</option>
+        </select>
+      </label>
+      <label class="check-row" style="margin:10px 0">
+        <input type="checkbox" id="cmpAutoUpload" checked>
+        <span>压缩后直接上传到百炼临时存储（用于理解）；不勾则仅本地压缩供下载</span>
+      </label>
+      <div id="cmpStatusWrap" class="upload-panel hidden" style="margin-top:6px">
+        <div class="up-info">
+          <div class="up-icon">🔧</div>
+          <div class="up-main">
+            <div class="up-name" id="cmpStatus">-</div>
+            <div class="up-stat" id="cmpStat">准备…</div>
+          </div>
+        </div>
+        <div class="up-bar"><div class="up-bar-fill" id="cmpBarFill"></div></div>
+      </div>
+      <div id="cmpResult" class="cmp-result hidden"></div>
+      <div class="hint" style="margin-top:8px">只降不放大：源分辨率/帧率低于所选时保持原样；输出 mp4（H.264 + AAC）并保留声音。</div>
+    </div>
+    <div class="modal-foot">
+      <button id="cmpCancel" class="btn btn-ghost hidden">取消</button>
+      <button id="cmpStart" class="btn btn-primary">开始压缩</button>
+      <button id="cmpUse" class="btn btn-primary hidden">✓ 用此结果继续</button>
     </div>
   </div>
 </div>
@@ -295,6 +358,7 @@
         <button id="btnImportData" class="btn btn-ghost btn-sm">导入数据</button>
         <input type="file" id="importFileInput" accept=".json" hidden>
         <button id="btnClearAll" class="btn btn-danger-ghost btn-sm">清空全部数据</button>
+        <button id="btnExportLog" class="btn btn-ghost btn-sm" title="导出服务端 server.log 与本次会话错误，便于排查上传/对话问题">📄 导出诊断日志</button>
       </div>
     </div>
     <div class="modal-foot">
